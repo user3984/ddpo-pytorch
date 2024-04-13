@@ -17,7 +17,8 @@ def _load_lines(path):
     if not os.path.exists(path):
         newpath = ASSETS_PATH.joinpath(path)
     if not os.path.exists(newpath):
-        raise FileNotFoundError(f"Could not find {path} or ddpo_pytorch.assets/{path}")
+        raise FileNotFoundError(
+            f"Could not find {path} or ddpo_pytorch.assets/{path}")
     path = newpath
     with open(path, "r") as f:
         return [line.strip() for line in f.readlines()]
