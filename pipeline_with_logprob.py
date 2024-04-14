@@ -7,9 +7,11 @@
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
+import numpy as np
+import PIL
 
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import (
-    StableDiffusionPipeline,
+    StableDiffusionInstructPix2PixPipeline,
     rescale_noise_cfg,
 )
 from ddim_with_logprob import ddim_step_with_logprob
@@ -17,12 +19,12 @@ from ddim_with_logprob import ddim_step_with_logprob
 
 @torch.no_grad()
 def pipeline_with_logprob(
-    self: StableDiffusionPipeline,
+    self: StableDiffusionInstructPix2PixPipeline,
     prompt: Union[str, List[str]] = None,
-    height: Optional[int] = None,
-    width: Optional[int] = None,
-    num_inference_steps: int = 50,
+    image: Union[PIL.Image.Image, np.ndarray, torch.FloatTensor, List[PIL.Image.Image], List[np.ndarray], List[torch.FloatTensor]] = None,
+    num_inference_steps: int = 100,
     guidance_scale: float = 7.5,
+    image_guidance_scale: float = 1.5,
     negative_prompt: Optional[Union[str, List[str]]] = None,
     num_images_per_prompt: Optional[int] = 1,
     eta: float = 0.0,
@@ -32,101 +34,91 @@ def pipeline_with_logprob(
     negative_prompt_embeds: Optional[torch.FloatTensor] = None,
     output_type: Optional[str] = "pil",
     return_dict: bool = True,
-    callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
-    callback_steps: int = 1,
-    cross_attention_kwargs: Optional[Dict[str, Any]] = None,
-    guidance_rescale: float = 0.0,
+    callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
+    callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+    **kwargs,
 ):
     r"""
-    Function invoked when calling the pipeline for generation.
+    The call function to the pipeline for generation.
 
     Args:
         prompt (`str` or `List[str]`, *optional*):
-            The prompt or prompts to guide the image generation. If not defined, one has to pass `prompt_embeds`.
-            instead.
-        height (`int`, *optional*, defaults to self.unet.config.sample_size * self.vae_scale_factor):
-            The height in pixels of the generated image.
-        width (`int`, *optional*, defaults to self.unet.config.sample_size * self.vae_scale_factor):
-            The width in pixels of the generated image.
-        num_inference_steps (`int`, *optional*, defaults to 50):
+            The prompt or prompts to guide image generation. If not defined, you need to pass `prompt_embeds`.
+        image (`torch.FloatTensor` `np.ndarray`, `PIL.Image.Image`, `List[torch.FloatTensor]`, `List[PIL.Image.Image]`, or `List[np.ndarray]`):
+            `Image` or tensor representing an image batch to be repainted according to `prompt`. Can also accept
+            image latents as `image`, but if passing latents directly it is not encoded again.
+        num_inference_steps (`int`, *optional*, defaults to 100):
             The number of denoising steps. More denoising steps usually lead to a higher quality image at the
             expense of slower inference.
         guidance_scale (`float`, *optional*, defaults to 7.5):
-            Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
-            `guidance_scale` is defined as `w` of equation 2. of [Imagen
-            Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
-            1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
-            usually at the expense of lower image quality.
+            A higher guidance scale value encourages the model to generate images closely linked to the text
+            `prompt` at the expense of lower image quality. Guidance scale is enabled when `guidance_scale > 1`.
+        image_guidance_scale (`float`, *optional*, defaults to 1.5):
+            Push the generated image towards the initial `image`. Image guidance scale is enabled by setting
+            `image_guidance_scale > 1`. Higher image guidance scale encourages generated images that are closely
+            linked to the source `image`, usually at the expense of lower image quality. This pipeline requires a
+            value of at least `1`.
         negative_prompt (`str` or `List[str]`, *optional*):
-            The prompt or prompts not to guide the image generation. If not defined, one has to pass
-            `negative_prompt_embeds` instead. Ignored when not using guidance (i.e., ignored if `guidance_scale` is
-            less than `1`).
+            The prompt or prompts to guide what to not include in image generation. If not defined, you need to
+            pass `negative_prompt_embeds` instead. Ignored when not using guidance (`guidance_scale < 1`).
         num_images_per_prompt (`int`, *optional*, defaults to 1):
             The number of images to generate per prompt.
         eta (`float`, *optional*, defaults to 0.0):
-            Corresponds to parameter eta (η) in the DDIM paper: https://arxiv.org/abs/2010.02502. Only applies to
-            [`schedulers.DDIMScheduler`], will be ignored for others.
-        generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
-            One or a list of [torch generator(s)](https://pytorch.org/docs/stable/generated/torch.Generator.html)
-            to make generation deterministic.
+            Corresponds to parameter eta (η) from the [DDIM](https://arxiv.org/abs/2010.02502) paper. Only applies
+            to the [`~schedulers.DDIMScheduler`], and is ignored in other schedulers.
+        generator (`torch.Generator`, *optional*):
+            A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make
+            generation deterministic.
         latents (`torch.FloatTensor`, *optional*):
-            Pre-generated noisy latents, sampled from a Gaussian distribution, to be used as inputs for image
+            Pre-generated noisy latents sampled from a Gaussian distribution, to be used as inputs for image
             generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
-            tensor will ge generated by sampling using the supplied random `generator`.
+            tensor is generated by sampling using the supplied random `generator`.
         prompt_embeds (`torch.FloatTensor`, *optional*):
-            Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
-            provided, text embeddings will be generated from `prompt` input argument.
+            Pre-generated text embeddings. Can be used to easily tweak text inputs (prompt weighting). If not
+            provided, text embeddings are generated from the `prompt` input argument.
         negative_prompt_embeds (`torch.FloatTensor`, *optional*):
-            Pre-generated negative text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
-            weighting. If not provided, negative_prompt_embeds will be generated from `negative_prompt` input
-            argument.
+            Pre-generated negative text embeddings. Can be used to easily tweak text inputs (prompt weighting). If
+            not provided, `negative_prompt_embeds` are generated from the `negative_prompt` input argument.
+        ip_adapter_image: (`PipelineImageInput`, *optional*):
+            Optional image input to work with IP Adapters.
         output_type (`str`, *optional*, defaults to `"pil"`):
-            The output format of the generate image. Choose between
-            [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
+            The output format of the generated image. Choose between `PIL.Image` or `np.array`.
         return_dict (`bool`, *optional*, defaults to `True`):
             Whether or not to return a [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] instead of a
             plain tuple.
-        callback (`Callable`, *optional*):
-            A function that will be called every `callback_steps` steps during inference. The function will be
-            called with the following arguments: `callback(step: int, timestep: int, latents: torch.FloatTensor)`.
-        callback_steps (`int`, *optional*, defaults to 1):
-            The frequency at which the `callback` function will be called. If not specified, the callback will be
-            called at every step.
-        cross_attention_kwargs (`dict`, *optional*):
-            A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
-            `self.processor` in
-            [diffusers.cross_attention](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/cross_attention.py).
-        guidance_rescale (`float`, *optional*, defaults to 0.7):
-            Guidance rescale factor proposed by [Common Diffusion Noise Schedules and Sample Steps are
-            Flawed](https://arxiv.org/pdf/2305.08891.pdf) `guidance_scale` is defined as `φ` in equation 16. of
-            [Common Diffusion Noise Schedules and Sample Steps are Flawed](https://arxiv.org/pdf/2305.08891.pdf).
-            Guidance rescale factor should fix overexposure when using zero terminal SNR.
-
-    Examples:
+        callback_on_step_end (`Callable`, *optional*):
+            A function that calls at the end of each denoising steps during the inference. The function is called
+            with the following arguments: `callback_on_step_end(self: DiffusionPipeline, step: int, timestep: int,
+            callback_kwargs: Dict)`. `callback_kwargs` will include a list of all tensors as specified by
+            `callback_on_step_end_tensor_inputs`.
+        callback_on_step_end_tensor_inputs (`List`, *optional*):
+            The list of tensor inputs for the `callback_on_step_end` function. The tensors specified in the list
+            will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
+            `._callback_tensor_inputs` attribute of your pipeline class.
 
     Returns:
         [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] or `tuple`:
-        [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] if `return_dict` is True, otherwise a `tuple.
-        When returning a tuple, the first element is a list with the generated images, and the second element is a
-        list of `bool`s denoting whether the corresponding generated image likely represents "not-safe-for-work"
-        (nsfw) content, according to the `safety_checker`.
+            If `return_dict` is `True`, [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] is returned,
+            otherwise a `tuple` is returned where the first element is a list with the generated images and the
+            second element is a list of `bool`s indicating whether the corresponding generated image contains
+            "not-safe-for-work" (nsfw) content.
     """
-    # 0. Default height and width to unet
-    height = height or self.unet.config.sample_size * self.vae_scale_factor
-    width = width or self.unet.config.sample_size * self.vae_scale_factor
 
-    # 1. Check inputs. Raise error if not correct
+    callback = kwargs.pop("callback", None)
+    callback_steps = kwargs.pop("callback_steps", None)
+
+    # 0. Check inputs
     self.check_inputs(
         prompt,
-        height,
-        width,
-        callback_steps,
         negative_prompt,
         prompt_embeds,
         negative_prompt_embeds,
     )
 
-    # 2. Define call parameters
+    if image is None:
+        raise ValueError("`image` input cannot be undefined.")
+
+    # 1. Define call parameters
     if prompt is not None and isinstance(prompt, str):
         batch_size = 1
     elif prompt is not None and isinstance(prompt, list):
@@ -135,17 +127,10 @@ def pipeline_with_logprob(
         batch_size = prompt_embeds.shape[0]
 
     device = self._execution_device
-    # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-    # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
-    # corresponds to doing no classifier free guidance.
+
+    # 2. Encode input prompt
     do_classifier_free_guidance = guidance_scale > 1.0
 
-    # 3. Encode input prompt
-    text_encoder_lora_scale = (
-        cross_attention_kwargs.get("scale", None)
-        if cross_attention_kwargs is not None
-        else None
-    )
     prompt_embeds = self._encode_prompt(
         prompt,
         device,
@@ -154,15 +139,31 @@ def pipeline_with_logprob(
         negative_prompt,
         prompt_embeds=prompt_embeds,
         negative_prompt_embeds=negative_prompt_embeds,
-        lora_scale=text_encoder_lora_scale,
     )
 
-    # 4. Prepare timesteps
+    # 3. Preprocess image
+    image = self.image_processor.preprocess(image)
+
+    # 4. set timesteps
     self.scheduler.set_timesteps(num_inference_steps, device=device)
     timesteps = self.scheduler.timesteps
 
-    # 5. Prepare latent variables
-    num_channels_latents = self.unet.config.in_channels
+    # 5. Prepare Image latents
+    image_latents = self.prepare_image_latents(
+        image,
+        batch_size,
+        num_images_per_prompt,
+        prompt_embeds.dtype,
+        device,
+        do_classifier_free_guidance,
+    )
+
+    height, width = image_latents.shape[-2:]
+    height = height * self.vae_scale_factor
+    width = width * self.vae_scale_factor
+
+    # 6. Prepare latent variables
+    num_channels_latents = self.vae.config.latent_channels
     latents = self.prepare_latents(
         batch_size * num_images_per_prompt,
         num_channels_latents,
@@ -174,44 +175,57 @@ def pipeline_with_logprob(
         latents,
     )
 
-    # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+    # 7. Check that shapes of latents and image match the UNet channels
+    num_channels_image = image_latents.shape[1]
+    if num_channels_latents + num_channels_image != self.unet.config.in_channels:
+        raise ValueError(
+            f"Incorrect configuration settings! The config of `pipeline.unet`: {self.unet.config} expects"
+            f" {self.unet.config.in_channels} but received `num_channels_latents`: {num_channels_latents} +"
+            f" `num_channels_image`: {num_channels_image} "
+            f" = {num_channels_latents+num_channels_image}. Please verify the config of"
+            " `pipeline.unet` or your `image` input."
+        )
+
+    # 8. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
     extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
-    # 7. Denoising loop
+    # 9. Denoising loop
     num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+    self._num_timesteps = len(timesteps)
+
     all_latents = [latents]
     all_log_probs = []
     with self.progress_bar(total=num_inference_steps) as progress_bar:
         for i, t in enumerate(timesteps):
-            # expand the latents if we are doing classifier free guidance
-            latent_model_input = (
-                torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-            )
-            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+            # Expand the latents if we are doing classifier free guidance.
+            # The latents are expanded 3 times because for pix2pix the guidance\
+            # is applied for both the text and the input image.
+            latent_model_input = torch.cat([latents] * 3) if do_classifier_free_guidance else latents
+
+            # concat latents, image_latents in the channel dimension
+            scaled_latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+            scaled_latent_model_input = torch.cat([scaled_latent_model_input, image_latents], dim=1)
 
             # predict the noise residual
             noise_pred = self.unet(
-                latent_model_input,
+                scaled_latent_model_input,
                 t,
                 encoder_hidden_states=prompt_embeds,
-                cross_attention_kwargs=cross_attention_kwargs,
+                added_cond_kwargs=None,
                 return_dict=False,
             )[0]
 
             # perform guidance
             if do_classifier_free_guidance:
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + guidance_scale * (
-                    noise_pred_text - noise_pred_uncond
+                noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
+                noise_pred = (
+                    noise_pred_uncond
+                    + self.guidance_scale * (noise_pred_text - noise_pred_image)
+                    + self.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
                 )
-
-            if do_classifier_free_guidance and guidance_rescale > 0.0:
-                # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
-                noise_pred = rescale_noise_cfg(
-                    noise_pred, noise_pred_text, guidance_rescale=guidance_rescale
-                )
-
+            
             # compute the previous noisy sample x_t -> x_t-1
+            # latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
             latents, log_prob = ddim_step_with_logprob(
                 self.scheduler, noise_pred, t, latents, **extra_step_kwargs
             )
@@ -219,21 +233,27 @@ def pipeline_with_logprob(
             all_latents.append(latents)
             all_log_probs.append(log_prob)
 
+            if callback_on_step_end is not None:
+                callback_kwargs = {}
+                for k in callback_on_step_end_tensor_inputs:
+                    callback_kwargs[k] = locals()[k]
+                callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                latents = callback_outputs.pop("latents", latents)
+                prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+                image_latents = callback_outputs.pop("image_latents", image_latents)
+
             # call the callback, if provided
-            if i == len(timesteps) - 1 or (
-                (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
-            ):
+            if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                 progress_bar.update()
                 if callback is not None and i % callback_steps == 0:
-                    callback(i, t, latents)
+                    step_idx = i // getattr(self.scheduler, "order", 1)
+                    callback(step_idx, t, latents)
 
     if not output_type == "latent":
-        image = self.vae.decode(
-            latents / self.vae.config.scaling_factor, return_dict=False
-        )[0]
-        image, has_nsfw_concept = self.run_safety_checker(
-            image, device, prompt_embeds.dtype
-        )
+        image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+        image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
     else:
         image = latents
         has_nsfw_concept = None
@@ -243,12 +263,12 @@ def pipeline_with_logprob(
     else:
         do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
 
-    image = self.image_processor.postprocess(
-        image, output_type=output_type, do_denormalize=do_denormalize
-    )
+    image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
 
-    # Offload last model to CPU
-    if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
-        self.final_offload_hook.offload()
+    # Offload all models
+    self.maybe_free_model_hooks()
+
+    if not return_dict:
+        return (image, has_nsfw_concept)
 
     return image, has_nsfw_concept, all_latents, all_log_probs
