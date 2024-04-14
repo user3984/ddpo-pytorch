@@ -12,7 +12,6 @@ from accelerate.logging import get_logger
 from diffusers import StableDiffusionInstructPix2PixPipeline, DDIMScheduler, UNet2DConditionModel
 from diffusers.loaders import AttnProcsLayers
 from diffusers.models.attention_processor import LoRAAttnProcessor
-from diffusers.image_processor import VaeImageProcessor
 import numpy as np
 from prompts import from_file, imagenet_all, imagenet_animals, imagenet_dogs, simple_animals, nouns_activities, counting
 from rewards import edit_reward
@@ -266,7 +265,7 @@ def main(_):
     # remote server running llava inference.
     # executor = futures.ThreadPoolExecutor(max_workers=2)
 
-    image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor) # TODO
+    do_classifier_free_guidance = config.sample.guidance_scale > 1.0
 
     # Train!
     samples_per_epoch = (
@@ -507,16 +506,18 @@ def main(_):
                 position=0,
                 disable=not accelerator.is_local_main_process,
             ):
+                original_images = pipeline.image_processor.preprocess(sample["original_images"])
+                image_latents = pipeline.prepare_image_latents(
+                    original_images,
+                    config.train.batch_size,
+                    1,
+                    embeds.dtype,
+                    accelerator.device,
+                    do_classifier_free_guidance,
+                )
                 if config.train.cfg:
                     # concat negative prompts to sample prompts to avoid two forward passes
                     embeds = torch.cat([sample["prompt_embeds"], train_neg_prompt_embeds, train_neg_prompt_embeds])
-                    # embeds = torch.cat(
-                    #     [train_neg_prompt_embeds, sample["prompt_embeds"]]
-                    # )
-                    image_latents = sample["original_images"]
-                    # TODO: original image latents
-                    uncond_image_latents = torch.zeros_like(image_latents)
-                    image_latents = torch.cat([image_latents, image_latents, uncond_image_latents], dim=0)
                 else:
                     embeds = sample["prompt_embeds"]
 
@@ -531,7 +532,7 @@ def main(_):
                         with autocast():
                             if config.train.cfg:
                                 noise_pred = unet(
-                                    torch.cat([torch.cat([sample["latents"][:, j]] * 3), ], dim=1),
+                                    torch.cat([torch.cat([sample["latents"][:, j]] * 3), image_latents], dim=1),
                                     torch.cat([sample["timesteps"][:, j]] * 3),
                                     embeds,
                                 ).sample
