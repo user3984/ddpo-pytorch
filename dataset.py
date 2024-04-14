@@ -8,7 +8,7 @@ from pycocotools import mask
 from torchvision import transforms
 from typing import Dict, List, Tuple
 from torch.utils.data import Dataset
-from torchmetrics.functional.multimodal import clip_score
+from torchmetrics.multimodal.clip_score import CLIPScore
 
 
 """
@@ -24,7 +24,7 @@ ASSET_PATH = "ddpo_pytorch/assets"
 IMGSET_PATH = "train2017"
 CLIP_MODEL = "openai/clip-vit-base-patch16"
 
-clip_score_fn = functools.partial(clip_score, model_name_or_path=CLIP_MODEL)
+clip_score_fn = CLIPScore(model_name_or_path=CLIP_MODEL)
 
 
 @functools.lru_cache(maxsize=1)
@@ -84,6 +84,7 @@ class EditingDataset(Dataset):
     def __init__(self):
         self.img_to_meta = load_img_metadata()
         self.ctg_to_prompts = load_prompts()
+        self.img_ids = list(self.img_to_meta.keys())
 
     def __len__(self):
         return len(self.img_to_meta)
@@ -95,8 +96,8 @@ class EditingDataset(Dataset):
         bin_mask = None
         bbox = None
 
-        meta = self.img_to_meta[index]
-        img_id = meta["img_id"]
+        img_id = self.img_ids[index]
+        meta = self.img_to_meta[img_id]
         ctg_id = meta["category_id"]
 
         # image
