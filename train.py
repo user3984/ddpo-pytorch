@@ -9,16 +9,19 @@ from ml_collections import config_flags
 from accelerate import Accelerator
 from accelerate.utils import set_seed, ProjectConfiguration
 from accelerate.logging import get_logger
-from diffusers import StableDiffusionPipeline, DDIMScheduler, UNet2DConditionModel
+from diffusers import StableDiffusionInstructPix2PixPipeline, DDIMScheduler, UNet2DConditionModel
 from diffusers.loaders import AttnProcsLayers
 from diffusers.models.attention_processor import LoRAAttnProcessor
+from diffusers.image_processor import VaeImageProcessor
 import numpy as np
 from prompts import from_file, imagenet_all, imagenet_animals, imagenet_dogs, simple_animals, nouns_activities, counting
-from rewards import jpeg_incompressibility, jpeg_compressibility, aesthetic_score, llava_strict_satisfaction, llava_bertscore
+from rewards import edit_reward
 from stat_tracking import PerPromptStatTracker
 from pipeline_with_logprob import pipeline_with_logprob
 from ddim_with_logprob import ddim_step_with_logprob
+from dataset import EditingDataset
 import torch
+from torch.utils.data import Dataset, DataLoader
 import wandb
 from functools import partial
 import tqdm
@@ -89,7 +92,7 @@ def main(_):
     set_seed(config.seed, device_specific=True)
 
     # load scheduler, tokenizer and models.
-    pipeline = StableDiffusionPipeline.from_pretrained(
+    pipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
         config.pretrained.model, revision=config.pretrained.revision
     )
     # freeze parameters of models to save more memory
@@ -226,8 +229,10 @@ def main(_):
     )
 
     # prepare prompt and reward fn
-    prompt_fn = eval(config.prompt_fn)
-    reward_fn = eval(config.reward_fn)()
+    dataset = EditingDataset()
+    data_loader = DataLoader(dataset, batch_size=config.train.batch_size, shuffle=True)
+    data_iter = iter(data_loader)
+    reward_fn = edit_reward
 
     # generate negative prompt embeddings
     neg_prompt_embed = pipeline.text_encoder(
@@ -259,7 +264,9 @@ def main(_):
 
     # executor to perform callbacks asynchronously. this is beneficial for the llava callbacks which makes a request to a
     # remote server running llava inference.
-    executor = futures.ThreadPoolExecutor(max_workers=2)
+    # executor = futures.ThreadPoolExecutor(max_workers=2)
+
+    image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor) # TODO
 
     # Train!
     samples_per_epoch = (
@@ -313,13 +320,19 @@ def main(_):
             disable=not accelerator.is_local_main_process,
             position=0,
         ):
-            # generate prompts
-            prompts, prompt_metadata = zip(
-                *[
-                    prompt_fn(**config.prompt_fn_kwargs)
-                    for _ in range(config.sample.batch_size)
-                ]
-            )
+            original_images, prompts, prompt_score_tokens, bin_masks, bboxes = next(data_iter)
+            # original_images: Tensor, [B, C, H, W]
+            # prompts, prompt_score_tokens: [Bx str]
+            # bin_masks: Tensor, [B, H, W]
+            # bboxes: Tensor, [B, 4]
+
+            # # generate prompts
+            # prompts, prompt_metadata = zip(
+            #     *[
+            #         prompt_fn(**config.prompt_fn_kwargs)
+            #         for _ in range(config.sample.batch_size)
+            #     ]
+            # )
 
             # encode prompts
             prompt_ids = pipeline.tokenizer(
@@ -335,10 +348,12 @@ def main(_):
             with autocast():
                 images, _, latents, log_probs = pipeline_with_logprob(
                     pipeline,
+                    image=original_images,
                     prompt_embeds=prompt_embeds,
                     negative_prompt_embeds=sample_neg_prompt_embeds,
                     num_inference_steps=config.sample.num_steps,
                     guidance_scale=config.sample.guidance_scale,
+                    image_guidance_scale=config.sample.image_guidance_scale,
                     eta=config.sample.eta,
                     output_type="pt",
                 )
@@ -352,12 +367,14 @@ def main(_):
             )  # (batch_size, num_steps)
 
             # compute rewards asynchronously
-            rewards = executor.submit(reward_fn, images, prompts, prompt_metadata)
+            # rewards = executor.submit(reward_fn, images, prompts, prompt_metadata)
+            rewards = reward_fn(original_images, images, prompt_score_tokens, bin_masks, bboxes)
             # yield to to make sure reward computation starts
-            time.sleep(0)
+            # time.sleep(0)
 
             samples.append(
                 {
+                    "original_images": original_images,
                     "prompt_ids": prompt_ids,
                     "prompt_embeds": prompt_embeds,
                     "timesteps": timesteps,
@@ -372,16 +389,16 @@ def main(_):
                 }
             )
 
-        # wait for all rewards to be computed
-        for sample in tqdm(
-            samples,
-            desc="Waiting for rewards",
-            disable=not accelerator.is_local_main_process,
-            position=0,
-        ):
-            rewards, reward_metadata = sample["rewards"].result()
-            # accelerator.print(reward_metadata)
-            sample["rewards"] = torch.as_tensor(rewards, device=accelerator.device)
+        # # wait for all rewards to be computed
+        # for sample in tqdm(
+        #     samples,
+        #     desc="Waiting for rewards",
+        #     disable=not accelerator.is_local_main_process,
+        #     position=0,
+        # ):
+        #     rewards, reward_metadata = sample["rewards"].result()
+        #     # accelerator.print(reward_metadata)
+        #     sample["rewards"] = torch.as_tensor(rewards, device=accelerator.device)
 
         # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
         samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
@@ -492,9 +509,14 @@ def main(_):
             ):
                 if config.train.cfg:
                     # concat negative prompts to sample prompts to avoid two forward passes
-                    embeds = torch.cat(
-                        [train_neg_prompt_embeds, sample["prompt_embeds"]]
-                    )
+                    embeds = torch.cat([sample["prompt_embeds"], train_neg_prompt_embeds, train_neg_prompt_embeds])
+                    # embeds = torch.cat(
+                    #     [train_neg_prompt_embeds, sample["prompt_embeds"]]
+                    # )
+                    image_latents = sample["original_images"]
+                    # TODO: original image latents
+                    uncond_image_latents = torch.zeros_like(image_latents)
+                    image_latents = torch.cat([image_latents, image_latents, uncond_image_latents], dim=0)
                 else:
                     embeds = sample["prompt_embeds"]
 
@@ -509,15 +531,15 @@ def main(_):
                         with autocast():
                             if config.train.cfg:
                                 noise_pred = unet(
-                                    torch.cat([sample["latents"][:, j]] * 2),
-                                    torch.cat([sample["timesteps"][:, j]] * 2),
+                                    torch.cat([torch.cat([sample["latents"][:, j]] * 3), ], dim=1),
+                                    torch.cat([sample["timesteps"][:, j]] * 3),
                                     embeds,
                                 ).sample
-                                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                                noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
                                 noise_pred = (
                                     noise_pred_uncond
-                                    + config.sample.guidance_scale
-                                    * (noise_pred_text - noise_pred_uncond)
+                                    + config.sample.guidance_scale * (noise_pred_text - noise_pred_image)
+                                    + config.sample.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
                                 )
                             else:
                                 noise_pred = unet(

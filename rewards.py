@@ -3,6 +3,110 @@ import io
 import numpy as np
 import torch
 
+from torchmetrics.multimodal.clip_score import CLIPScore
+
+
+"""
+PLEASE ENSURE FOLLOWING FILES EXIST:
+ddpo_pytorch/assets/high_freq_obj.txt
+ddpo_pytorch/assets/other_obj.txt
+ddpo_pytorch/assets/prompts.pkl
+ddpo_pytorch/assets/training_img.pkl
+
+"""
+
+ASSET_PATH = "ddpo_pytorch/assets"
+IMGSET_PATH = "train2017"
+CLIP_MODEL = "openai/clip-vit-base-patch16"
+
+clip_score_fn = CLIPScore(model_name_or_path=CLIP_MODEL)
+
+@torch.no_grad
+def edit_reward(org_imgs, new_imgs, prompt_score_tokens, bin_masks, bboxes, w1=1.0, w2=1.0) -> float:
+    """ reward = w1 * regional_penalty + w2 * semantic_similarity """
+
+    regional_penalty = - _mse_outside_mask_batch(org_imgs, new_imgs, bin_masks)
+    roi_imgs = _batchwise_crop(new_imgs, bboxes)
+    semantics_similarity = _semantics_similarity(roi_imgs, prompt_score_tokens)
+
+    assert len(regional_penalty) == len(semantics_similarity)
+    print("regional_penalty:", regional_penalty)
+    print("semantics_similarity:", semantics_similarity)
+
+    return w1 * regional_penalty + w2 * semantics_similarity
+
+
+def _batchwise_crop(images, bboxes):
+    """
+    Crop images in a batch according to specified bounding boxes.
+
+    Parameters:
+        images (torch.Tensor): Tensor of shape (B, C, H, W) where B is batch size,
+                               C is number of channels, H is image height, and W is image width.
+        bboxes (list of tuples): List of tuples (x, y, w, h) representing the bounding box for each image,
+                                 where x, y are the coordinates of the top-left corner of the bounding box,
+                                 w is the width, and h is the height of the bounding box.
+
+    Returns:
+        torch.Tensor: Tensor of cropped images. Note: Each image might have different sizes due to different bounding boxes.
+    """
+    cropped_images = []
+    for image, (x, y, w, h) in zip(images, bboxes):
+        # Ensure the bounding box is within the image dimensions
+        x_end = x + w
+        y_end = y + h
+        # Crop the image
+        cropped_image = image[:, y:y_end, x:x_end]
+        cropped_images.append(cropped_image)
+
+    # Note: Returning a list because images can have different sizes
+    return cropped_images
+
+
+def _semantics_similarity(images, prompt_score_tokens):
+
+    def calculate_clip_score(images, prompts):
+        images_int = (images * 255).astype("uint8")
+        clip_score = clip_score_fn(torch.from_numpy(
+            images_int).permute(0, 3, 1, 2), prompts).detach()
+        return round(float(clip_score), 4)
+
+    scores = []
+    for image, prompt in zip(images, prompt_score_tokens):
+        scores.append(calculate_clip_score([image], [prompt]))
+
+    return torch.tensor(scores)
+
+
+def _mse_outside_mask_batch(tensorA, tensorB, tensor_mask):
+    """
+    Compute the MSE (Mean Squared Error) between batches of images outside the masked regions using PyTorch.
+
+    Parameters:
+        tensorA (torch.Tensor): First batch of images (tensor format, shape BxCxHxW).
+        tensorB (torch.Tensor): Second batch of images (tensor format, shape BxCxHxW).
+        tensor_mask (torch.Tensor): Batch of binary masks where regions to exclude are white (1) and regions to include are black (0).
+
+    Returns:
+        torch.Tensor: MSE values for each pair in the batch.
+    """
+    # Ensure mask is boolean (0 for regions to include)
+    valid_mask = tensor_mask == 0
+
+    # Ensure valid_mask covers all color channels
+    valid_mask = valid_mask.unsqueeze(1).repeat(1, 3, 1, 1)
+
+    # Calculate squared differences
+    diff = tensorA - tensorB
+    squared_diff = diff.pow(2)
+
+    # Apply the mask and compute MSE
+    valid_squared_diff = (squared_diff * valid_mask).sum(dim=[1, 2, 3])
+    mse = valid_squared_diff / valid_mask.sum(dim=[1, 2, 3])
+
+    return mse
+
+##########################################
 
 def jpeg_incompressibility():
     def _fn(images, prompts, metadata):

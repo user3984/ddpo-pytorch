@@ -220,10 +220,10 @@ def pipeline_with_logprob(
                 noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
                 noise_pred = (
                     noise_pred_uncond
-                    + self.guidance_scale * (noise_pred_text - noise_pred_image)
-                    + self.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
+                    + guidance_scale * (noise_pred_text - noise_pred_image)
+                    + image_guidance_scale * (noise_pred_image - noise_pred_uncond)
                 )
-            
+
             # compute the previous noisy sample x_t -> x_t-1
             # latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
             latents, log_prob = ddim_step_with_logprob(
