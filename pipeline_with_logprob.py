@@ -10,10 +10,8 @@ import torch
 import numpy as np
 import PIL
 
-from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import (
-    StableDiffusionInstructPix2PixPipeline,
-    rescale_noise_cfg,
-)
+from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import rescale_noise_cfg
+from diffusers import StableDiffusionInstructPix2PixPipeline
 from ddim_with_logprob import ddim_step_with_logprob
 
 
@@ -34,8 +32,8 @@ def pipeline_with_logprob(
     negative_prompt_embeds: Optional[torch.FloatTensor] = None,
     output_type: Optional[str] = "pil",
     return_dict: bool = True,
-    callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
-    callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+    callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+    callback_steps: int = 1,
     **kwargs,
 ):
     r"""
@@ -104,16 +102,8 @@ def pipeline_with_logprob(
             "not-safe-for-work" (nsfw) content.
     """
 
-    callback = kwargs.pop("callback", None)
-    callback_steps = kwargs.pop("callback_steps", None)
-
     # 0. Check inputs
-    self.check_inputs(
-        prompt,
-        negative_prompt,
-        prompt_embeds,
-        negative_prompt_embeds,
-    )
+    self.check_inputs(prompt, callback_steps, negative_prompt, prompt_embeds, negative_prompt_embeds)
 
     if image is None:
         raise ValueError("`image` input cannot be undefined.")
@@ -208,11 +198,7 @@ def pipeline_with_logprob(
 
             # predict the noise residual
             noise_pred = self.unet(
-                scaled_latent_model_input,
-                t,
-                encoder_hidden_states=prompt_embeds,
-                added_cond_kwargs=None,
-                return_dict=False,
+                scaled_latent_model_input, t, encoder_hidden_states=prompt_embeds, return_dict=False,
             )[0]
 
             # perform guidance
@@ -233,23 +219,11 @@ def pipeline_with_logprob(
             all_latents.append(latents)
             all_log_probs.append(log_prob)
 
-            if callback_on_step_end is not None:
-                callback_kwargs = {}
-                for k in callback_on_step_end_tensor_inputs:
-                    callback_kwargs[k] = locals()[k]
-                callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
-
-                latents = callback_outputs.pop("latents", latents)
-                prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
-                image_latents = callback_outputs.pop("image_latents", image_latents)
-
             # call the callback, if provided
             if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                 progress_bar.update()
                 if callback is not None and i % callback_steps == 0:
-                    step_idx = i // getattr(self.scheduler, "order", 1)
-                    callback(step_idx, t, latents)
+                    callback(i, t, latents)
 
     if not output_type == "latent":
         image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
@@ -265,8 +239,9 @@ def pipeline_with_logprob(
 
     image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
 
-    # Offload all models
-    self.maybe_free_model_hooks()
+    # Offload last model to CPU
+    if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
+        self.final_offload_hook.offload()
 
     if not return_dict:
         return (image, has_nsfw_concept)

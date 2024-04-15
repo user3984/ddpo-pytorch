@@ -15,20 +15,21 @@ ddpo_pytorch/assets/training_img.pkl
 
 """
 
-ASSET_PATH = "ddpo_pytorch/assets"
+ASSET_PATH = "assets"
 IMGSET_PATH = "train2017"
 CLIP_MODEL = "openai/clip-vit-base-patch16"
+DEVICE = 'cuda'
 
-clip_score_fn = CLIPScore(model_name_or_path=CLIP_MODEL)
+clip_score_fn = CLIPScore(model_name_or_path=CLIP_MODEL).to(DEVICE)
 
-@torch.no_grad
-def edit_reward(org_imgs, new_imgs, prompt_score_tokens, bin_masks, bboxes, w1=1.0, w2=1.0) -> float:
+@torch.no_grad()
+def edit_reward(org_imgs, new_imgs, prompt_score_tokens, bin_masks, bboxes, w1=1000.0, w2=1.0, expand=0.1) -> float:
     """ reward = w1 * regional_penalty + w2 * semantic_similarity """
 
     regional_penalty = - _mse_outside_mask_batch(org_imgs, new_imgs, bin_masks)
-    roi_imgs = _batchwise_crop(new_imgs, bboxes)
+    roi_imgs = _batchwise_crop(new_imgs, bboxes, expand)
     semantics_similarity = _semantics_similarity(roi_imgs, prompt_score_tokens)
-
+    
     assert len(regional_penalty) == len(semantics_similarity)
     print("regional_penalty:", regional_penalty)
     print("semantics_similarity:", semantics_similarity)
@@ -36,7 +37,7 @@ def edit_reward(org_imgs, new_imgs, prompt_score_tokens, bin_masks, bboxes, w1=1
     return w1 * regional_penalty + w2 * semantics_similarity
 
 
-def _batchwise_crop(images, bboxes):
+def _batchwise_crop(images, bboxes, expand=0.1):
     """
     Crop images in a batch according to specified bounding boxes.
 
@@ -46,6 +47,7 @@ def _batchwise_crop(images, bboxes):
         bboxes (list of tuples): List of tuples (x, y, w, h) representing the bounding box for each image,
                                  where x, y are the coordinates of the top-left corner of the bounding box,
                                  w is the width, and h is the height of the bounding box.
+        expand (float): expand factor for bounding box. Default=0.1.
 
     Returns:
         torch.Tensor: Tensor of cropped images. Note: Each image might have different sizes due to different bounding boxes.
@@ -53,29 +55,34 @@ def _batchwise_crop(images, bboxes):
     cropped_images = []
     for image, (x, y, w, h) in zip(images, bboxes):
         # Ensure the bounding box is within the image dimensions
-        x_end = x + w
-        y_end = y + h
+        img_h, img_w = image.shape[-2:]
+        x, y, w, h = float(x), float(y), float(w), float(h)
+        x_min = max(round(x - expand * w), 0)
+        x_max = min(round(x + w + expand * w), img_w)
+        y_min = max(round(y - expand * h), 0)
+        y_max = min(round(y + h + expand * h), img_h)
+
         # Crop the image
-        cropped_image = image[:, y:y_end, x:x_end]
+        cropped_image = image[:, y_min:y_max, x_min:x_max]
         cropped_images.append(cropped_image)
 
     # Note: Returning a list because images can have different sizes
     return cropped_images
 
+@torch.no_grad()
+def calculate_clip_score(image, prompt):
+    # print(image.shape)
+    image_int = (image * 255).round().clamp(0, 255).to(torch.uint8)
+    clip_score = clip_score_fn(image_int, prompt).detach()
+    return float(clip_score)
+
 
 def _semantics_similarity(images, prompt_score_tokens):
-
-    def calculate_clip_score(images, prompts):
-        images_int = (images * 255).astype("uint8")
-        clip_score = clip_score_fn(torch.from_numpy(
-            images_int).permute(0, 3, 1, 2), prompts).detach()
-        return round(float(clip_score), 4)
-
     scores = []
     for image, prompt in zip(images, prompt_score_tokens):
-        scores.append(calculate_clip_score([image], [prompt]))
+        scores.append(calculate_clip_score(image, prompt))
 
-    return torch.tensor(scores)
+    return torch.tensor(scores).to(DEVICE)
 
 
 def _mse_outside_mask_batch(tensorA, tensorB, tensor_mask):
@@ -291,3 +298,4 @@ def llava_bertscore():
         return np.array(all_scores), {k: np.array(v) for k, v in all_info.items()}
 
     return _fn
+

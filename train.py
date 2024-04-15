@@ -128,6 +128,7 @@ def main(_):
     if config.use_lora:
         # Set correct lora layers
         lora_attn_procs = {}
+        print("attn_processors.keys:", pipeline.unet.attn_processors.keys())
         for name in pipeline.unet.attn_processors.keys():
             cross_attention_dim = (
                 None
@@ -229,7 +230,7 @@ def main(_):
 
     # prepare prompt and reward fn
     dataset = EditingDataset()
-    data_loader = DataLoader(dataset, batch_size=config.train.batch_size, shuffle=True)
+    data_loader = DataLoader(dataset, batch_size=config.sample.batch_size, shuffle=True, num_workers=8)
     data_iter = iter(data_loader)
     reward_fn = edit_reward
 
@@ -320,6 +321,7 @@ def main(_):
             position=0,
         ):
             original_images, prompts, prompt_score_tokens, bin_masks, bboxes = next(data_iter)
+            
             # original_images: Tensor, [B, C, H, W]
             # prompts, prompt_score_tokens: [Bx str]
             # bin_masks: Tensor, [B, H, W]
@@ -367,13 +369,13 @@ def main(_):
 
             # compute rewards asynchronously
             # rewards = executor.submit(reward_fn, images, prompts, prompt_metadata)
-            rewards = reward_fn(original_images, images, prompt_score_tokens, bin_masks, bboxes)
+            rewards = reward_fn(original_images.to(accelerator.device), images, prompt_score_tokens, bin_masks.to(accelerator.device), bboxes)
             # yield to to make sure reward computation starts
             # time.sleep(0)
 
             samples.append(
                 {
-                    "original_images": original_images,
+                    "original_images": original_images.to(accelerator.device),
                     "prompt_ids": prompt_ids,
                     "prompt_embeds": prompt_embeds,
                     "timesteps": timesteps,
@@ -408,14 +410,14 @@ def main(_):
                 pil = Image.fromarray(
                     (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
                 )
-                pil = pil.resize((256, 256))
+                # pil = pil.resize((256, 256))
                 pil.save(os.path.join(tmpdir, f"{i}.jpg"))
             accelerator.log(
                 {
                     "images": [
                         wandb.Image(
                             os.path.join(tmpdir, f"{i}.jpg"),
-                            caption=f"{prompt:.25} | {reward:.2f}",
+                            caption=f"{prompt} | {reward:.2f}",
                         )
                         for i, (prompt, reward) in enumerate(
                             zip(prompts, rewards)
@@ -506,6 +508,12 @@ def main(_):
                 position=0,
                 disable=not accelerator.is_local_main_process,
             ):
+                if config.train.cfg:
+                    # concat negative prompts to sample prompts to avoid two forward passes
+                    embeds = torch.cat([sample["prompt_embeds"], train_neg_prompt_embeds, train_neg_prompt_embeds])
+                else:
+                    embeds = sample["prompt_embeds"]
+
                 original_images = pipeline.image_processor.preprocess(sample["original_images"])
                 image_latents = pipeline.prepare_image_latents(
                     original_images,
@@ -515,11 +523,6 @@ def main(_):
                     accelerator.device,
                     do_classifier_free_guidance,
                 )
-                if config.train.cfg:
-                    # concat negative prompts to sample prompts to avoid two forward passes
-                    embeds = torch.cat([sample["prompt_embeds"], train_neg_prompt_embeds, train_neg_prompt_embeds])
-                else:
-                    embeds = sample["prompt_embeds"]
 
                 for j in tqdm(
                     range(num_train_timesteps),

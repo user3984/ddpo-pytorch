@@ -15,13 +15,13 @@ from torchmetrics.multimodal.clip_score import CLIPScore
 PLEASE ENSURE FOLLOWING FILES EXIST:
 ddpo_pytorch/assets/high_freq_obj.txt
 ddpo_pytorch/assets/other_obj.txt
-ddpo_pytorch/assets/prompts.pkl
-ddpo_pytorch/assets/training_img.pkl
+ddpo_pytorch/assets/prompts_v2.pkl
+ddpo_pytorch/assets/filtered_annotations.pkl
 
 """
 
-ASSET_PATH = "ddpo_pytorch/assets"
-IMGSET_PATH = "train2017"
+ASSET_PATH = "assets"
+IMGSET_PATH = "/workspace/data/train2017"
 CLIP_MODEL = "openai/clip-vit-base-patch16"
 
 clip_score_fn = CLIPScore(model_name_or_path=CLIP_MODEL)
@@ -53,7 +53,7 @@ def load_prompts() -> Dict[int, List[Tuple]]:
                     'a transparent glass monitor'),
                     ...]
     """
-    path = os.path.join(ASSET_PATH, f"prompts.pkl")
+    path = os.path.join(ASSET_PATH, f"prompts_v2.pkl")
     with open(path, 'rb') as fp:
         data = pickle.load(fp)
     return data
@@ -74,10 +74,14 @@ def load_img_metadata() -> Dict[int, List[Dict]]:
         'area': 46323.61
     }]
     """
-    path = os.path.join(ASSET_PATH, f"training_img.pkl")
+    path = os.path.join(ASSET_PATH, f"filtered_annotations.pkl")
     with open(path, 'rb') as fp:
         data = pickle.load(fp)
     return data
+
+
+# def collate_fn(batch):
+#     return list(map(list, zip(*batch)))
 
 
 class EditingDataset(Dataset):
@@ -112,7 +116,7 @@ class EditingDataset(Dataset):
         w, h = img.size
         segs = anno["segmentation"]
         rle = mask.frPyObjects(segs, h, w)
-        bin_mask = mask.decode(rle)
+        bin_mask = mask.decode(rle).sum(axis=-1) > 0
 
         # bbox
         bbox = anno["bbox"]
