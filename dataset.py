@@ -15,7 +15,7 @@ from torchmetrics.multimodal.clip_score import CLIPScore
 PLEASE ENSURE FOLLOWING FILES EXIST:
 ddpo_pytorch/assets/high_freq_obj.txt
 ddpo_pytorch/assets/other_obj.txt
-ddpo_pytorch/assets/prompts_v2.pkl
+ddpo_pytorch/assets/prompts_v3.pkl
 ddpo_pytorch/assets/filtered_annotations.pkl
 
 """
@@ -53,7 +53,7 @@ def load_prompts() -> Dict[int, List[Tuple]]:
                     'a transparent glass monitor'),
                     ...]
     """
-    path = os.path.join(ASSET_PATH, f"prompts_v2.pkl")
+    path = os.path.join(ASSET_PATH, f"prompts_v3.pkl")
     with open(path, 'rb') as fp:
         data = pickle.load(fp)
     return data

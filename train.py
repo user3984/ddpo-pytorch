@@ -128,7 +128,7 @@ def main(_):
     if config.use_lora:
         # Set correct lora layers
         lora_attn_procs = {}
-        print("attn_processors.keys:", pipeline.unet.attn_processors.keys())
+        # print("attn_processors.keys:", pipeline.unet.attn_processors.keys())
         for name in pipeline.unet.attn_processors.keys():
             cross_attention_dim = (
                 None
@@ -230,9 +230,8 @@ def main(_):
 
     # prepare prompt and reward fn
     dataset = EditingDataset()
-    data_loader = DataLoader(dataset, batch_size=config.sample.batch_size, shuffle=True, num_workers=8)
+    data_loader = DataLoader(dataset, batch_size=config.sample.batch_size, shuffle=False, num_workers=8)
     data_iter = iter(data_loader)
-    reward_fn = edit_reward
 
     # generate negative prompt embeddings
     neg_prompt_embed = pipeline.text_encoder(
@@ -369,7 +368,11 @@ def main(_):
 
             # compute rewards asynchronously
             # rewards = executor.submit(reward_fn, images, prompts, prompt_metadata)
-            rewards = reward_fn(original_images.to(accelerator.device), images, prompt_score_tokens, bin_masks.to(accelerator.device), bboxes)
+            rewards, regional_rewards, semantics_rewards = edit_reward(original_images.to(accelerator.device),
+                                                                       images,
+                                                                       prompt_score_tokens,
+                                                                       bin_masks.to(accelerator.device),
+                                                                       bboxes)
             # yield to to make sure reward computation starts
             # time.sleep(0)
 
@@ -387,6 +390,8 @@ def main(_):
                     ],  # each entry is the latent after timestep t
                     "log_probs": log_probs,
                     "rewards": rewards,
+                    "regional_rewards": regional_rewards,
+                    "semantics_rewards": semantics_rewards
                 }
             )
 
@@ -405,8 +410,9 @@ def main(_):
         samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
 
         # this is a hack to force wandb to log the images as JPEGs instead of PNGs
+        log_images = torch.cat([original_images.to(accelerator.device), images], dim=2)
         with tempfile.TemporaryDirectory() as tmpdir:
-            for i, image in enumerate(images):
+            for i, image in enumerate(log_images):
                 pil = Image.fromarray(
                     (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
                 )
@@ -417,10 +423,10 @@ def main(_):
                     "images": [
                         wandb.Image(
                             os.path.join(tmpdir, f"{i}.jpg"),
-                            caption=f"{prompt} | {reward:.2f}",
+                            caption=f"{prompt} | {reward:.2f} | {regional_reward:.2f} | {semantics_reward:.2f}",
                         )
-                        for i, (prompt, reward) in enumerate(
-                            zip(prompts, rewards)
+                        for i, (prompt, reward, regional_reward, semantics_reward) in enumerate(
+                            zip(prompts, rewards, regional_rewards, semantics_rewards)
                         )  # only log rewards from process 0
                     ],
                 },
@@ -429,14 +435,19 @@ def main(_):
 
         # gather rewards across processes
         rewards = accelerator.gather(samples["rewards"]).cpu().numpy()
+        regional_rewards = accelerator.gather(samples["regional_rewards"]).cpu().numpy()
+        semantics_rewards = accelerator.gather(samples["semantics_rewards"]).cpu().numpy()
+        
 
         # log rewards and images
         accelerator.log(
             {
-                "reward": rewards,
-                "epoch": epoch,
+                # "reward": rewards,
+                # "epoch": epoch,
                 "reward_mean": rewards.mean(),
                 "reward_std": rewards.std(),
+                "regional_rewards_mean": regional_rewards.mean(),
+                "semantics_rewards_mean": semantics_rewards.mean()
             },
             step=global_step,
         )
@@ -610,7 +621,7 @@ def main(_):
                         # log training-related stuff
                         info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
                         info = accelerator.reduce(info, reduction="mean")
-                        info.update({"epoch": epoch, "inner_epoch": inner_epoch})
+                        # info.update({"epoch": epoch, "inner_epoch": inner_epoch})
                         accelerator.log(info, step=global_step)
                         global_step += 1
                         info = defaultdict(list)

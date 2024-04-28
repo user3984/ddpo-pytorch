@@ -21,20 +21,23 @@ CLIP_MODEL = "openai/clip-vit-base-patch16"
 DEVICE = 'cuda'
 
 clip_score_fn = CLIPScore(model_name_or_path=CLIP_MODEL).to(DEVICE)
+dist_func = torch.nn.SmoothL1Loss(beta=0.2, reduction='none')
 
 @torch.no_grad()
-def edit_reward(org_imgs, new_imgs, prompt_score_tokens, bin_masks, bboxes, w1=1000.0, w2=1.0, expand=0.1) -> float:
+def edit_reward(org_imgs, new_imgs, prompt_score_tokens, bin_masks, bboxes, w1=32.0, w2=1.0, expand=0.1):
     """ reward = w1 * regional_penalty + w2 * semantic_similarity """
 
     regional_penalty = - _mse_outside_mask_batch(org_imgs, new_imgs, bin_masks)
     roi_imgs = _batchwise_crop(new_imgs, bboxes, expand)
+    roi_imgs_old = _batchwise_crop(org_imgs, bboxes, expand)
     semantics_similarity = _semantics_similarity(roi_imgs, prompt_score_tokens)
-    
-    assert len(regional_penalty) == len(semantics_similarity)
-    print("regional_penalty:", regional_penalty)
-    print("semantics_similarity:", semantics_similarity)
+    semantics_similarity_old = _semantics_similarity(roi_imgs_old, prompt_score_tokens)
+    semantics_reward = torch.maximum(semantics_similarity - semantics_similarity_old, torch.zeros(1).to(DEVICE))
 
-    return w1 * regional_penalty + w2 * semantics_similarity
+    # avoid large penalty
+    regional_penalty = torch.maximum(regional_penalty, -0.5 * torch.ones(1).to(DEVICE))
+
+    return w1 * regional_penalty + w2 * semantics_reward, w1 * regional_penalty, w2 * semantics_reward
 
 
 def _batchwise_crop(images, bboxes, expand=0.1):
@@ -104,12 +107,12 @@ def _mse_outside_mask_batch(tensorA, tensorB, tensor_mask):
     valid_mask = valid_mask.unsqueeze(1).repeat(1, 3, 1, 1)
 
     # Calculate squared differences
-    diff = tensorA - tensorB
-    squared_diff = diff.pow(2)
+    # diff = tensorA - tensorB
 
     # Apply the mask and compute MSE
-    valid_squared_diff = (squared_diff * valid_mask).sum(dim=[1, 2, 3])
-    mse = valid_squared_diff / valid_mask.sum(dim=[1, 2, 3])
+    valid_diff = (dist_func(tensorA, tensorB) * valid_mask).sum(dim=[1, 2, 3])
+    # valid_diff = (diff.abs() * valid_mask).sum(dim=[1, 2, 3])
+    mse = valid_diff / valid_mask.sum(dim=[1, 2, 3])
 
     return mse
 
